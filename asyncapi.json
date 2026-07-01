@@ -1,0 +1,911 @@
+{
+  "asyncapi": "3.0.0",
+  "info": {
+    "title": "Internal Billing Workflow Routes",
+    "version": "1.0.0",
+    "description": "Event-driven billing workflows. Request/reply workers run over Google Pub/Sub (a `*.requested.v1` request topic, replying on a `*.provisioned.v1` topic); the usage reporter consumes a Pub/Sub stream with ack/nack and no reply; Stripe lifecycle webhooks arrive as signed HTTP POSTs. Side-effect emails are sent to MailerSend out-of-band and are not modeled as channels. Entitlement state lives in Neon Postgres (repository_entitlements, org_subscription_entitlements, org_subscription_periods, stripe_customer_mappings)."
+  },
+  "defaultContentType": "application/json",
+  "servers": {
+    "pubsub": {
+      "host": "pubsub.googleapis.com",
+      "protocol": "googlepubsub",
+      "description": "Google Cloud Pub/Sub. Request/reply correlation is carried in message attributes (request_id) and the reply topic (per-request reply_topic override, else the worker default).",
+      "bindings": {
+        "googlepubsub": {
+          "bindingVersion": "0.2.0",
+          "projectId": "{gcpProjectId}"
+        }
+      },
+      "variables": {
+        "gcpProjectId": {
+          "description": "GCP project the topics/subscriptions live in.",
+          "default": "your-project"
+        }
+      }
+    },
+    "stripeWebhooks": {
+      "host": "{serviceHost}",
+      "protocol": "https",
+      "description": "Inbound Stripe webhooks. Every request is verified against the endpoint's signing secret (whsec_...) over the exact raw body before processing. Bodies over 256 KiB are rejected with 413.",
+      "variables": {
+        "serviceHost": {
+          "description": "Public host of the billing webhook service.",
+          "default": "billing.internal.example.com"
+        }
+      }
+    }
+  },
+  "channels": {
+    "oneOffPaymentRequests": {
+      "address": "one-off.requested.v1",
+      "title": "One-off payment checkout requests",
+      "description": "Requests to provision a Stripe one-off (payment-mode) Checkout Session.",
+      "servers": [{ "$ref": "#/servers/pubsub" }],
+      "bindings": { "googlepubsub": { "bindingVersion": "0.2.0", "topic": "one-off.requested.v1" } },
+      "messages": { "OneOffPaymentRequest": { "$ref": "#/components/messages/OneOffPaymentRequest" } }
+    },
+    "oneOffPaymentResponses": {
+      "address": "one-off.provisioned.v1",
+      "title": "One-off payment checkout responses",
+      "description": "Checkout URL (or failure) for a one-off payment request. Overridable per request via reply_topic.",
+      "servers": [{ "$ref": "#/servers/pubsub" }],
+      "bindings": { "googlepubsub": { "bindingVersion": "0.2.0", "topic": "one-off.provisioned.v1" } },
+      "messages": { "OneOffPaymentResponse": { "$ref": "#/components/messages/OneOffPaymentResponse" } }
+    },
+    "customerMappingRequests": {
+      "address": "customer-mapping.requested.v1",
+      "title": "Ensure Stripe customer mapping requests",
+      "description": "Requests to resolve or create the org/repo -> Stripe customer mapping.",
+      "servers": [{ "$ref": "#/servers/pubsub" }],
+      "bindings": { "googlepubsub": { "bindingVersion": "0.2.0", "topic": "customer-mapping.requested.v1" } },
+      "messages": { "EnsureCustomerMappingRequest": { "$ref": "#/components/messages/EnsureCustomerMappingRequest" } }
+    },
+    "customerMappingResponses": {
+      "address": "customer-mapping.provisioned.v1",
+      "title": "Ensure Stripe customer mapping responses",
+      "servers": [{ "$ref": "#/servers/pubsub" }],
+      "bindings": { "googlepubsub": { "bindingVersion": "0.2.0", "topic": "customer-mapping.provisioned.v1" } },
+      "messages": { "EnsureCustomerMappingResponse": { "$ref": "#/components/messages/EnsureCustomerMappingResponse" } }
+    },
+    "billingPortalRequests": {
+      "address": "billing-portal-session.requested.v1",
+      "title": "Billing portal session requests",
+      "servers": [{ "$ref": "#/servers/pubsub" }],
+      "bindings": { "googlepubsub": { "bindingVersion": "0.2.0", "topic": "billing-portal-session.requested.v1" } },
+      "messages": { "ProvisionBillingSessionRequest": { "$ref": "#/components/messages/ProvisionBillingSessionRequest" } }
+    },
+    "billingPortalResponses": {
+      "address": "billing-portal-session.provisioned.v1",
+      "title": "Billing portal session responses",
+      "servers": [{ "$ref": "#/servers/pubsub" }],
+      "bindings": { "googlepubsub": { "bindingVersion": "0.2.0", "topic": "billing-portal-session.provisioned.v1" } },
+      "messages": { "ProvisionBillingSessionResponse": { "$ref": "#/components/messages/ProvisionBillingSessionResponse" } }
+    },
+    "entitlementQueryRequests": {
+      "address": "entitlement-query.requested.v1",
+      "title": "Entitlement status query requests",
+      "description": "Read-only entitlement lookups scoped by repository_id OR org_id (exactly one).",
+      "servers": [{ "$ref": "#/servers/pubsub" }],
+      "bindings": { "googlepubsub": { "bindingVersion": "0.2.0", "topic": "entitlement-query.requested.v1" } },
+      "messages": { "QueryEntitlementRequest": { "$ref": "#/components/messages/QueryEntitlementRequest" } }
+    },
+    "entitlementQueryResponses": {
+      "address": "entitlement-query.provisioned.v1",
+      "title": "Entitlement status query responses",
+      "servers": [{ "$ref": "#/servers/pubsub" }],
+      "bindings": { "googlepubsub": { "bindingVersion": "0.2.0", "topic": "entitlement-query.provisioned.v1" } },
+      "messages": { "QueryEntitlementResponse": { "$ref": "#/components/messages/QueryEntitlementResponse" } }
+    },
+    "subscriptionCancelRequests": {
+      "address": "usage-subscription-cancellation.requested.v1",
+      "title": "Usage subscription cancellation requests",
+      "servers": [{ "$ref": "#/servers/pubsub" }],
+      "bindings": { "googlepubsub": { "bindingVersion": "0.2.0", "topic": "usage-subscription-cancellation.requested.v1" } },
+      "messages": { "CancelSubscriptionRequest": { "$ref": "#/components/messages/CancelSubscriptionRequest" } }
+    },
+    "subscriptionCancelResponses": {
+      "address": "usage-subscription-cancellation.provisioned.v1",
+      "title": "Usage subscription cancellation acknowledgements",
+      "servers": [{ "$ref": "#/servers/pubsub" }],
+      "bindings": { "googlepubsub": { "bindingVersion": "0.2.0", "topic": "usage-subscription-cancellation.provisioned.v1" } },
+      "messages": { "CancelSubscriptionResponse": { "$ref": "#/components/messages/CancelSubscriptionResponse" } }
+    },
+    "usageSubscriptionRequests": {
+      "address": "usage-subscription.requested.v1",
+      "title": "Usage subscription checkout requests",
+      "description": "Requests to provision a subscription-mode Checkout Session for a metered usage price.",
+      "servers": [{ "$ref": "#/servers/pubsub" }],
+      "bindings": { "googlepubsub": { "bindingVersion": "0.2.0", "topic": "usage-subscription.requested.v1" } },
+      "messages": { "UsageSubscriptionRequest": { "$ref": "#/components/messages/UsageSubscriptionRequest" } }
+    },
+    "usageSubscriptionResponses": {
+      "address": "usage-subscription.provisioned.v1",
+      "title": "Usage subscription checkout responses",
+      "servers": [{ "$ref": "#/servers/pubsub" }],
+      "bindings": { "googlepubsub": { "bindingVersion": "0.2.0", "topic": "usage-subscription.provisioned.v1" } },
+      "messages": { "UsageSubscriptionResponse": { "$ref": "#/components/messages/UsageSubscriptionResponse" } }
+    },
+    "usageEvents": {
+      "address": "usage-report.requested.v1",
+      "title": "Usage meter events",
+      "description": "Usage events reported to Stripe's meter-events endpoint. The consumer acks on success and nacks on any failure so Pub/Sub redelivers / dead-letters. No reply is published. event_id is reused as Stripe's idempotency identifier.",
+      "servers": [{ "$ref": "#/servers/pubsub" }],
+      "bindings": { "googlepubsub": { "bindingVersion": "0.2.0", "subscription": { "name": "usage-report.worker" } } },
+      "messages": { "UsageEvent": { "$ref": "#/components/messages/UsageEvent" } }
+    },
+    "webhookOneOffCompleted": {
+      "address": "/webhooks/stripe/one-off",
+      "title": "Stripe checkout.session.completed (one-off paid)",
+      "servers": [{ "$ref": "#/servers/stripeWebhooks" }],
+      "messages": { "CheckoutSessionCompleted": { "$ref": "#/components/messages/CheckoutSessionCompleted" } }
+    },
+    "webhookOneOffExpired": {
+      "address": "/webhooks/stripe/one-off-expired",
+      "title": "Stripe checkout.session.expired",
+      "servers": [{ "$ref": "#/servers/stripeWebhooks" }],
+      "messages": { "CheckoutSessionExpired": { "$ref": "#/components/messages/CheckoutSessionExpired" } }
+    },
+    "webhookOneOffFailed": {
+      "address": "/webhooks/stripe/one-off-failed",
+      "title": "Stripe checkout.session.async_payment_failed",
+      "servers": [{ "$ref": "#/servers/stripeWebhooks" }],
+      "messages": { "CheckoutSessionAsyncPaymentFailed": { "$ref": "#/components/messages/CheckoutSessionAsyncPaymentFailed" } }
+    },
+    "webhookOneOffRefunded": {
+      "address": "/webhooks/stripe/one-off-refund",
+      "title": "Stripe charge.refunded",
+      "servers": [{ "$ref": "#/servers/stripeWebhooks" }],
+      "messages": { "ChargeRefunded": { "$ref": "#/components/messages/ChargeRefunded" } }
+    },
+    "webhookDisputeCreated": {
+      "address": "/webhooks/stripe/dispute-created",
+      "title": "Stripe charge.dispute.created",
+      "servers": [{ "$ref": "#/servers/stripeWebhooks" }],
+      "messages": { "ChargeDisputeCreated": { "$ref": "#/components/messages/ChargeDisputeCreated" } }
+    },
+    "webhookSubscriptionActivation": {
+      "address": "/webhooks/stripe/subscription-activation",
+      "title": "Stripe customer.subscription.created (active)",
+      "servers": [{ "$ref": "#/servers/stripeWebhooks" }],
+      "messages": { "CustomerSubscriptionCreated": { "$ref": "#/components/messages/CustomerSubscriptionCreated" } }
+    },
+    "webhookSubscriptionRenewalSucceeded": {
+      "address": "/webhooks/stripe/subscription-renewal",
+      "title": "Stripe invoice.paid (usage renewal)",
+      "servers": [{ "$ref": "#/servers/stripeWebhooks" }],
+      "messages": { "InvoicePaid": { "$ref": "#/components/messages/InvoicePaid" } }
+    },
+    "webhookSubscriptionRenewalFailed": {
+      "address": "/webhooks/stripe/subscription-renewal-failed",
+      "title": "Stripe invoice.payment_failed (usage)",
+      "servers": [{ "$ref": "#/servers/stripeWebhooks" }],
+      "messages": { "InvoicePaymentFailed": { "$ref": "#/components/messages/InvoicePaymentFailed" } }
+    },
+    "webhookSubscriptionUpdated": {
+      "address": "/webhooks/stripe/subscription-updated",
+      "title": "Stripe customer.subscription.updated",
+      "servers": [{ "$ref": "#/servers/stripeWebhooks" }],
+      "messages": { "CustomerSubscriptionUpdated": { "$ref": "#/components/messages/CustomerSubscriptionUpdated" } }
+    },
+    "webhookSubscriptionCancellation": {
+      "address": "/webhooks/stripe/subscription-cancellation",
+      "title": "Stripe customer.subscription.deleted",
+      "servers": [{ "$ref": "#/servers/stripeWebhooks" }],
+      "messages": { "CustomerSubscriptionDeleted": { "$ref": "#/components/messages/CustomerSubscriptionDeleted" } }
+    },
+    "webhookSubscriptionTrialEnding": {
+      "address": "/webhooks/stripe/subscription-trial-ending",
+      "title": "Stripe customer.subscription.trial_will_end",
+      "servers": [{ "$ref": "#/servers/stripeWebhooks" }],
+      "messages": { "CustomerSubscriptionTrialWillEnd": { "$ref": "#/components/messages/CustomerSubscriptionTrialWillEnd" } }
+    }
+  },
+  "operations": {
+    "provisionOneOffPaymentCheckout": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/oneOffPaymentRequests" },
+      "summary": "Provision one-off payment checkout",
+      "description": "Decode the request, create a Stripe one-off Checkout Session, and reply with the URL (or a Failed response). MVP acks regardless so a poison message can't loop.",
+      "messages": [{ "$ref": "#/channels/oneOffPaymentRequests/messages/OneOffPaymentRequest" }],
+      "reply": {
+        "channel": { "$ref": "#/channels/oneOffPaymentResponses" },
+        "messages": [{ "$ref": "#/channels/oneOffPaymentResponses/messages/OneOffPaymentResponse" }]
+      }
+    },
+    "ensureCustomerMapping": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/customerMappingRequests" },
+      "summary": "Ensure Stripe customer mapping",
+      "description": "Read-through-then-create: an existing mapping short-circuits before Stripe is touched; the persist is race-safe via ON CONFLICT DO NOTHING.",
+      "messages": [{ "$ref": "#/channels/customerMappingRequests/messages/EnsureCustomerMappingRequest" }],
+      "reply": {
+        "channel": { "$ref": "#/channels/customerMappingResponses" },
+        "messages": [{ "$ref": "#/channels/customerMappingResponses/messages/EnsureCustomerMappingResponse" }]
+      }
+    },
+    "provisionBillingPortalSession": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/billingPortalRequests" },
+      "summary": "Provision billing portal session",
+      "messages": [{ "$ref": "#/channels/billingPortalRequests/messages/ProvisionBillingSessionRequest" }],
+      "reply": {
+        "channel": { "$ref": "#/channels/billingPortalResponses" },
+        "messages": [{ "$ref": "#/channels/billingPortalResponses/messages/ProvisionBillingSessionResponse" }]
+      }
+    },
+    "queryEntitlementStatus": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/entitlementQueryRequests" },
+      "summary": "Query entitlement status",
+      "description": "Read-only. A missing entitlement yields result=not_found, not an error.",
+      "messages": [{ "$ref": "#/channels/entitlementQueryRequests/messages/QueryEntitlementRequest" }],
+      "reply": {
+        "channel": { "$ref": "#/channels/entitlementQueryResponses" },
+        "messages": [{ "$ref": "#/channels/entitlementQueryResponses/messages/QueryEntitlementResponse" }]
+      }
+    },
+    "cancelUsageSubscription": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/subscriptionCancelRequests" },
+      "summary": "Cancel usage subscription",
+      "messages": [{ "$ref": "#/channels/subscriptionCancelRequests/messages/CancelSubscriptionRequest" }],
+      "reply": {
+        "channel": { "$ref": "#/channels/subscriptionCancelResponses" },
+        "messages": [{ "$ref": "#/channels/subscriptionCancelResponses/messages/CancelSubscriptionResponse" }]
+      }
+    },
+    "provisionUsageSubscriptionCheckout": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/usageSubscriptionRequests" },
+      "summary": "Provision usage subscription checkout",
+      "description": "Subscription-mode Checkout Session for a metered price; quantity is intentionally omitted.",
+      "messages": [{ "$ref": "#/channels/usageSubscriptionRequests/messages/UsageSubscriptionRequest" }],
+      "reply": {
+        "channel": { "$ref": "#/channels/usageSubscriptionResponses" },
+        "messages": [{ "$ref": "#/channels/usageSubscriptionResponses/messages/UsageSubscriptionResponse" }]
+      }
+    },
+    "reportSubscriptionUsage": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/usageEvents" },
+      "summary": "Report subscription usage to Stripe",
+      "description": "Reports each usage event to Stripe's meter-events endpoint. Acks on success; nacks on any failure for Pub/Sub redelivery / dead-lettering. No reply.",
+      "messages": [{ "$ref": "#/channels/usageEvents/messages/UsageEvent" }]
+    },
+    "processOneOffPaymentWebhook": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/webhookOneOffCompleted" },
+      "summary": "Process Stripe one-off payment webhook",
+      "description": "Mark repository_entitlements.status='paid' (idempotent upsert; transitions only when not already paid). Receipt email sent on first transition.",
+      "bindings": { "http": { "bindingVersion": "0.3.0", "method": "POST" } },
+      "messages": [{ "$ref": "#/channels/webhookOneOffCompleted/messages/CheckoutSessionCompleted" }]
+    },
+    "processOneOffExpiredWebhook": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/webhookOneOffExpired" },
+      "summary": "Process one-off checkout expired webhook",
+      "description": "Mark status='expired'; never downgrades a 'paid' row; idempotent.",
+      "bindings": { "http": { "bindingVersion": "0.3.0", "method": "POST" } },
+      "messages": [{ "$ref": "#/channels/webhookOneOffExpired/messages/CheckoutSessionExpired" }]
+    },
+    "processOneOffFailedWebhook": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/webhookOneOffFailed" },
+      "summary": "Process one-off payment failed webhook",
+      "description": "Mark status='failed'; never downgrades 'paid'; failure email on first transition.",
+      "bindings": { "http": { "bindingVersion": "0.3.0", "method": "POST" } },
+      "messages": [{ "$ref": "#/channels/webhookOneOffFailed/messages/CheckoutSessionAsyncPaymentFailed" }]
+    },
+    "processOneOffRefundWebhook": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/webhookOneOffRefunded" },
+      "summary": "Process one-off payment refunded webhook",
+      "description": "Revoke entitlement (status='refunded'); overrides 'paid'; refund email on first transition.",
+      "bindings": { "http": { "bindingVersion": "0.3.0", "method": "POST" } },
+      "messages": [{ "$ref": "#/channels/webhookOneOffRefunded/messages/ChargeRefunded" }]
+    },
+    "processDisputeCreatedWebhook": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/webhookDisputeCreated" },
+      "summary": "Process dispute created webhook",
+      "description": "Revoke entitlement (status='disputed'); overrides 'paid'; internal ops alert email on first transition.",
+      "bindings": { "http": { "bindingVersion": "0.3.0", "method": "POST" } },
+      "messages": [{ "$ref": "#/channels/webhookDisputeCreated/messages/ChargeDisputeCreated" }]
+    },
+    "processSubscriptionActivationWebhook": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/webhookSubscriptionActivation" },
+      "summary": "Process usage subscription activation webhook",
+      "description": "Only an 'active' created subscription activates the entitlement; confirmation email on first transition.",
+      "bindings": { "http": { "bindingVersion": "0.3.0", "method": "POST" } },
+      "messages": [{ "$ref": "#/channels/webhookSubscriptionActivation/messages/CustomerSubscriptionCreated" }]
+    },
+    "processSubscriptionRenewalSucceededWebhook": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/webhookSubscriptionRenewalSucceeded" },
+      "summary": "Process usage subscription renewal succeeded webhook",
+      "description": "Keep entitlement active and insert the paid period keyed on invoice_id; renewal receipt sent only when the period is newly recorded.",
+      "bindings": { "http": { "bindingVersion": "0.3.0", "method": "POST" } },
+      "messages": [{ "$ref": "#/channels/webhookSubscriptionRenewalSucceeded/messages/InvoicePaid" }]
+    },
+    "processSubscriptionRenewalFailedWebhook": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/webhookSubscriptionRenewalFailed" },
+      "summary": "Process usage subscription renewal payment failed webhook",
+      "description": "Mark status='past_due'; never resurrects 'canceled'; dunning email on first transition.",
+      "bindings": { "http": { "bindingVersion": "0.3.0", "method": "POST" } },
+      "messages": [{ "$ref": "#/channels/webhookSubscriptionRenewalFailed/messages/InvoicePaymentFailed" }]
+    },
+    "processSubscriptionUpdatedWebhook": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/webhookSubscriptionUpdated" },
+      "summary": "Process usage subscription updated webhook",
+      "description": "Mirror subscription.status into the entitlement (honors any transition, including canceled->active). No email side effect.",
+      "bindings": { "http": { "bindingVersion": "0.3.0", "method": "POST" } },
+      "messages": [{ "$ref": "#/channels/webhookSubscriptionUpdated/messages/CustomerSubscriptionUpdated" }]
+    },
+    "processSubscriptionCancellationWebhook": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/webhookSubscriptionCancellation" },
+      "summary": "Process usage subscription cancellation webhook",
+      "description": "Mark status='canceled' (terminal override); cancellation email on first transition.",
+      "bindings": { "http": { "bindingVersion": "0.3.0", "method": "POST" } },
+      "messages": [{ "$ref": "#/channels/webhookSubscriptionCancellation/messages/CustomerSubscriptionDeleted" }]
+    },
+    "processSubscriptionTrialEndingWebhook": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/webhookSubscriptionTrialEnding" },
+      "summary": "Process usage subscription trial ending webhook",
+      "description": "Record trial_end_at without flipping status (a notice). Reminder email sent only when trial_end_at is newly set to this value.",
+      "bindings": { "http": { "bindingVersion": "0.3.0", "method": "POST" } },
+      "messages": [{ "$ref": "#/channels/webhookSubscriptionTrialEnding/messages/CustomerSubscriptionTrialWillEnd" }]
+    }
+  },
+  "components": {
+    "messages": {
+      "OneOffPaymentRequest": {
+        "name": "OneOffPaymentRequest",
+        "title": "One-off payment checkout request",
+        "contentType": "application/json",
+        "headers": { "$ref": "#/components/schemas/PubSubRoutingHeaders" },
+        "payload": { "$ref": "#/components/schemas/OneOffPaymentRequest" }
+      },
+      "OneOffPaymentResponse": {
+        "name": "OneOffPaymentResponse",
+        "title": "One-off payment checkout response",
+        "contentType": "application/json",
+        "headers": { "$ref": "#/components/schemas/PubSubReplyHeaders" },
+        "payload": { "$ref": "#/components/schemas/OneOffPaymentResponse" }
+      },
+      "EnsureCustomerMappingRequest": {
+        "name": "EnsureCustomerMappingRequest",
+        "contentType": "application/json",
+        "headers": { "$ref": "#/components/schemas/PubSubRoutingHeaders" },
+        "payload": { "$ref": "#/components/schemas/EnsureCustomerMappingRequest" }
+      },
+      "EnsureCustomerMappingResponse": {
+        "name": "EnsureCustomerMappingResponse",
+        "contentType": "application/json",
+        "headers": { "$ref": "#/components/schemas/PubSubReplyHeaders" },
+        "payload": { "$ref": "#/components/schemas/EnsureCustomerMappingResponse" }
+      },
+      "ProvisionBillingSessionRequest": {
+        "name": "ProvisionBillingSessionRequest",
+        "contentType": "application/json",
+        "headers": { "$ref": "#/components/schemas/PubSubRoutingHeaders" },
+        "payload": { "$ref": "#/components/schemas/ProvisionBillingSessionRequest" }
+      },
+      "ProvisionBillingSessionResponse": {
+        "name": "ProvisionBillingSessionResponse",
+        "contentType": "application/json",
+        "headers": { "$ref": "#/components/schemas/PubSubReplyHeaders" },
+        "payload": { "$ref": "#/components/schemas/ProvisionBillingSessionResponse" }
+      },
+      "QueryEntitlementRequest": {
+        "name": "QueryEntitlementRequest",
+        "contentType": "application/json",
+        "headers": { "$ref": "#/components/schemas/PubSubRoutingHeaders" },
+        "payload": { "$ref": "#/components/schemas/QueryEntitlementRequest" }
+      },
+      "QueryEntitlementResponse": {
+        "name": "QueryEntitlementResponse",
+        "contentType": "application/json",
+        "headers": { "$ref": "#/components/schemas/PubSubResultHeaders" },
+        "payload": { "$ref": "#/components/schemas/QueryEntitlementResponse" }
+      },
+      "CancelSubscriptionRequest": {
+        "name": "CancelSubscriptionRequest",
+        "contentType": "application/json",
+        "headers": { "$ref": "#/components/schemas/PubSubRoutingHeaders" },
+        "payload": { "$ref": "#/components/schemas/CancelSubscriptionRequest" }
+      },
+      "CancelSubscriptionResponse": {
+        "name": "CancelSubscriptionResponse",
+        "contentType": "application/json",
+        "headers": { "$ref": "#/components/schemas/PubSubReplyHeaders" },
+        "payload": { "$ref": "#/components/schemas/CancelSubscriptionResponse" }
+      },
+      "UsageSubscriptionRequest": {
+        "name": "UsageSubscriptionRequest",
+        "contentType": "application/json",
+        "headers": { "$ref": "#/components/schemas/PubSubRoutingHeaders" },
+        "payload": { "$ref": "#/components/schemas/UsageSubscriptionRequest" }
+      },
+      "UsageSubscriptionResponse": {
+        "name": "UsageSubscriptionResponse",
+        "contentType": "application/json",
+        "headers": { "$ref": "#/components/schemas/PubSubReplyHeaders" },
+        "payload": { "$ref": "#/components/schemas/UsageSubscriptionResponse" }
+      },
+      "UsageEvent": {
+        "name": "UsageEvent",
+        "title": "Usage meter event",
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/UsageEvent" }
+      },
+      "CheckoutSessionCompleted": {
+        "name": "CheckoutSessionCompleted",
+        "contentType": "application/json",
+        "x-stripe-event-type": "checkout.session.completed",
+        "headers": { "$ref": "#/components/schemas/StripeWebhookHeaders" },
+        "payload": { "$ref": "#/components/schemas/StripeEventCheckoutSession" }
+      },
+      "CheckoutSessionExpired": {
+        "name": "CheckoutSessionExpired",
+        "contentType": "application/json",
+        "x-stripe-event-type": "checkout.session.expired",
+        "headers": { "$ref": "#/components/schemas/StripeWebhookHeaders" },
+        "payload": { "$ref": "#/components/schemas/StripeEventCheckoutSession" }
+      },
+      "CheckoutSessionAsyncPaymentFailed": {
+        "name": "CheckoutSessionAsyncPaymentFailed",
+        "contentType": "application/json",
+        "x-stripe-event-type": "checkout.session.async_payment_failed",
+        "headers": { "$ref": "#/components/schemas/StripeWebhookHeaders" },
+        "payload": { "$ref": "#/components/schemas/StripeEventCheckoutSession" }
+      },
+      "ChargeRefunded": {
+        "name": "ChargeRefunded",
+        "contentType": "application/json",
+        "x-stripe-event-type": "charge.refunded",
+        "headers": { "$ref": "#/components/schemas/StripeWebhookHeaders" },
+        "payload": { "$ref": "#/components/schemas/StripeEventCharge" }
+      },
+      "ChargeDisputeCreated": {
+        "name": "ChargeDisputeCreated",
+        "contentType": "application/json",
+        "x-stripe-event-type": "charge.dispute.created",
+        "headers": { "$ref": "#/components/schemas/StripeWebhookHeaders" },
+        "payload": { "$ref": "#/components/schemas/StripeEventDispute" }
+      },
+      "CustomerSubscriptionCreated": {
+        "name": "CustomerSubscriptionCreated",
+        "contentType": "application/json",
+        "x-stripe-event-type": "customer.subscription.created",
+        "headers": { "$ref": "#/components/schemas/StripeWebhookHeaders" },
+        "payload": { "$ref": "#/components/schemas/StripeEventSubscription" }
+      },
+      "InvoicePaid": {
+        "name": "InvoicePaid",
+        "contentType": "application/json",
+        "x-stripe-event-type": "invoice.paid",
+        "headers": { "$ref": "#/components/schemas/StripeWebhookHeaders" },
+        "payload": { "$ref": "#/components/schemas/StripeEventInvoice" }
+      },
+      "InvoicePaymentFailed": {
+        "name": "InvoicePaymentFailed",
+        "contentType": "application/json",
+        "x-stripe-event-type": "invoice.payment_failed",
+        "headers": { "$ref": "#/components/schemas/StripeWebhookHeaders" },
+        "payload": { "$ref": "#/components/schemas/StripeEventInvoice" }
+      },
+      "CustomerSubscriptionUpdated": {
+        "name": "CustomerSubscriptionUpdated",
+        "contentType": "application/json",
+        "x-stripe-event-type": "customer.subscription.updated",
+        "headers": { "$ref": "#/components/schemas/StripeWebhookHeaders" },
+        "payload": { "$ref": "#/components/schemas/StripeEventSubscription" }
+      },
+      "CustomerSubscriptionDeleted": {
+        "name": "CustomerSubscriptionDeleted",
+        "contentType": "application/json",
+        "x-stripe-event-type": "customer.subscription.deleted",
+        "headers": { "$ref": "#/components/schemas/StripeWebhookHeaders" },
+        "payload": { "$ref": "#/components/schemas/StripeEventSubscription" }
+      },
+      "CustomerSubscriptionTrialWillEnd": {
+        "name": "CustomerSubscriptionTrialWillEnd",
+        "contentType": "application/json",
+        "x-stripe-event-type": "customer.subscription.trial_will_end",
+        "headers": { "$ref": "#/components/schemas/StripeWebhookHeaders" },
+        "payload": { "$ref": "#/components/schemas/StripeEventSubscription" }
+      }
+    },
+    "schemas": {
+      "PubSubRoutingHeaders": {
+        "type": "object",
+        "description": "Pub/Sub message attributes carried for identity/routing.",
+        "properties": {
+          "application_id": { "type": "string" },
+          "tenant_id": { "type": "string" },
+          "user_id": { "type": "string" }
+        }
+      },
+      "PubSubReplyHeaders": {
+        "type": "object",
+        "description": "Reply attributes: routing attributes echoed from the request plus correlation fields.",
+        "properties": {
+          "application_id": { "type": "string" },
+          "tenant_id": { "type": "string" },
+          "user_id": { "type": "string" },
+          "request_id": { "type": "string" },
+          "status": { "type": "string" }
+        },
+        "required": ["request_id", "status"]
+      },
+      "PubSubResultHeaders": {
+        "type": "object",
+        "description": "Reply attributes for the entitlement-query worker, which sets 'result' rather than 'status'.",
+        "properties": {
+          "application_id": { "type": "string" },
+          "tenant_id": { "type": "string" },
+          "user_id": { "type": "string" },
+          "request_id": { "type": "string" },
+          "result": { "type": "string", "enum": ["found", "not_found", "failed"] }
+        },
+        "required": ["request_id", "result"]
+      },
+      "StripeWebhookHeaders": {
+        "type": "object",
+        "properties": {
+          "Stripe-Signature": {
+            "type": "string",
+            "description": "Signature header verified over the raw body with the endpoint signing secret. Required; absence yields 400."
+          },
+          "Content-Type": {
+            "type": "string",
+            "description": "Must start with application/json when present; a declared non-JSON type yields 415. A missing Content-Type is allowed.",
+            "default": "application/json"
+          }
+        },
+        "required": ["Stripe-Signature"]
+      },
+      "Metadata": {
+        "type": "object",
+        "description": "Free-form string map.",
+        "additionalProperties": { "type": "string" }
+      },
+      "OneOffPaymentRequest": {
+        "type": "object",
+        "required": ["request_id"],
+        "properties": {
+          "request_id": { "type": "string", "description": "Caller correlation id, echoed on the response." },
+          "price_id": { "type": "string", "description": "Preferred: Stripe-managed Price id. If present, the ad-hoc fields are ignored." },
+          "amount_minor": { "type": "integer", "format": "int64", "description": "Ad-hoc amount in the currency's minor unit; used only when price_id is absent." },
+          "currency": { "type": "string", "description": "ISO 4217 code for the ad-hoc path; defaults to usd." },
+          "product_name": { "type": "string", "description": "Ad-hoc line-item product name." },
+          "quantity": { "type": "integer", "format": "int64", "minimum": 0, "default": 1 },
+          "customer_email": { "type": "string" },
+          "success_url": { "type": "string", "description": "Required by Stripe in payment mode (falls back to CHECKOUT_SUCCESS_URL)." },
+          "cancel_url": { "type": "string" },
+          "reply_topic": { "type": "string", "description": "Per-request override of the reply topic." },
+          "metadata": { "$ref": "#/components/schemas/Metadata" }
+        }
+      },
+      "OneOffPaymentResponse": {
+        "type": "object",
+        "required": ["request_id", "status"],
+        "properties": {
+          "request_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["provisioned", "failed"] },
+          "checkout_session_id": { "type": "string", "nullable": true },
+          "checkout_url": { "type": "string", "nullable": true },
+          "error": { "type": "string", "nullable": true }
+        }
+      },
+      "EnsureCustomerMappingRequest": {
+        "type": "object",
+        "required": ["request_id"],
+        "properties": {
+          "request_id": { "type": "string" },
+          "org_id": { "type": "string", "description": "Org/repo principal to map. Missing surfaces as a validation failure, not a decode error." },
+          "email": { "type": "string", "description": "Applied when a new Stripe customer is created." },
+          "name": { "type": "string", "description": "Applied when a new Stripe customer is created." },
+          "reply_topic": { "type": "string" },
+          "metadata": { "$ref": "#/components/schemas/Metadata" }
+        }
+      },
+      "EnsureCustomerMappingResponse": {
+        "type": "object",
+        "required": ["request_id", "status", "created"],
+        "properties": {
+          "request_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["ensured", "failed"] },
+          "org_id": { "type": "string", "nullable": true },
+          "customer_id": { "type": "string", "nullable": true },
+          "created": { "type": "boolean", "description": "True only when this call created a new Stripe customer." },
+          "error": { "type": "string", "nullable": true }
+        }
+      },
+      "ProvisionBillingSessionRequest": {
+        "type": "object",
+        "required": ["request_id"],
+        "properties": {
+          "request_id": { "type": "string" },
+          "customer_id": { "type": "string", "description": "The org's Stripe customer id. Required to open a portal session." },
+          "org_id": { "type": "string", "description": "Echoed back for correlation." },
+          "return_url": { "type": "string", "description": "Where Stripe sends the user after the portal." },
+          "reply_topic": { "type": "string" },
+          "metadata": { "$ref": "#/components/schemas/Metadata" }
+        }
+      },
+      "ProvisionBillingSessionResponse": {
+        "type": "object",
+        "required": ["request_id", "status"],
+        "properties": {
+          "request_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["provisioned", "failed"] },
+          "portal_url": { "type": "string", "nullable": true },
+          "customer_id": { "type": "string", "nullable": true },
+          "org_id": { "type": "string", "nullable": true },
+          "error": { "type": "string", "nullable": true }
+        }
+      },
+      "QueryEntitlementRequest": {
+        "type": "object",
+        "required": ["request_id"],
+        "description": "Exactly one of repository_id / org_id is required (mutually exclusive).",
+        "properties": {
+          "request_id": { "type": "string" },
+          "repository_id": { "type": "string", "description": "Read repository_entitlements." },
+          "org_id": { "type": "string", "description": "Read org_subscription_entitlements." },
+          "reply_topic": { "type": "string" },
+          "metadata": { "$ref": "#/components/schemas/Metadata" }
+        }
+      },
+      "QueryEntitlementResponse": {
+        "type": "object",
+        "required": ["request_id", "result"],
+        "properties": {
+          "request_id": { "type": "string" },
+          "result": { "type": "string", "enum": ["found", "not_found", "failed"] },
+          "scope": { "type": "string", "enum": ["repository", "org"], "nullable": true },
+          "subject_id": { "type": "string", "nullable": true },
+          "entitlement_status": { "type": "string", "nullable": true, "description": "e.g. paid, active, refunded." },
+          "error": { "type": "string", "nullable": true }
+        }
+      },
+      "CancelSubscriptionRequest": {
+        "type": "object",
+        "required": ["request_id"],
+        "properties": {
+          "request_id": { "type": "string" },
+          "subscription_id": { "type": "string", "description": "Stripe subscription id to cancel. Required (validation failure if absent)." },
+          "org_id": { "type": "string", "description": "Echoed back for correlation." },
+          "reply_topic": { "type": "string" },
+          "metadata": { "$ref": "#/components/schemas/Metadata" }
+        }
+      },
+      "CancelSubscriptionResponse": {
+        "type": "object",
+        "required": ["request_id", "status"],
+        "properties": {
+          "request_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["acknowledged", "failed"] },
+          "subscription_id": { "type": "string", "nullable": true },
+          "org_id": { "type": "string", "nullable": true },
+          "subscription_status": { "type": "string", "nullable": true, "description": "Resulting Stripe status, e.g. canceled." },
+          "error": { "type": "string", "nullable": true }
+        }
+      },
+      "UsageSubscriptionRequest": {
+        "type": "object",
+        "required": ["request_id"],
+        "properties": {
+          "request_id": { "type": "string" },
+          "usage_price_id": { "type": "string", "description": "Stripe-managed recurring metered price id. Required (validation failure if absent)." },
+          "customer_email": { "type": "string" },
+          "success_url": { "type": "string", "description": "Required by Stripe (falls back to CHECKOUT_SUCCESS_URL)." },
+          "cancel_url": { "type": "string" },
+          "reply_topic": { "type": "string" },
+          "metadata": { "$ref": "#/components/schemas/Metadata" }
+        }
+      },
+      "UsageSubscriptionResponse": {
+        "type": "object",
+        "required": ["request_id", "status"],
+        "properties": {
+          "request_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["provisioned", "failed"] },
+          "checkout_session_id": { "type": "string", "nullable": true },
+          "checkout_url": { "type": "string", "nullable": true },
+          "error": { "type": "string", "nullable": true }
+        }
+      },
+      "UsageEvent": {
+        "type": "object",
+        "required": ["event_id", "stripe_customer_id", "value"],
+        "properties": {
+          "event_id": { "type": "string", "description": "Unique id; reused as the Stripe meter-event idempotency identifier." },
+          "stripe_customer_id": { "type": "string", "description": "Customer the usage is billed to. Must be non-empty (else the event is nacked)." },
+          "value": { "type": "integer", "format": "int64", "minimum": 0, "description": "Metered value to report." },
+          "event_name": { "type": "string", "description": "Optional meter event_name; falls back to the configured default." },
+          "timestamp": { "type": "integer", "format": "int64", "description": "Optional event time (unix seconds); falls back to now at Stripe." }
+        }
+      },
+      "StripeEventEnvelope": {
+        "type": "object",
+        "description": "Subset of the Stripe Event envelope consumed by the handlers. The full Stripe payload is delivered; only the fields below are read.",
+        "required": ["id", "type", "data"],
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "type": "string", "description": "Stripe event type, e.g. charge.dispute.created." },
+          "data": {
+            "type": "object",
+            "required": ["object"],
+            "properties": { "object": { "type": "object" } }
+          }
+        }
+      },
+      "StripeEventCheckoutSession": {
+        "allOf": [
+          { "$ref": "#/components/schemas/StripeEventEnvelope" },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "object",
+                "properties": {
+                  "object": {
+                    "type": "object",
+                    "description": "Stripe CheckoutSession (partial).",
+                    "properties": {
+                      "id": { "type": "string" },
+                      "metadata": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Must carry repository_id for the entitlement key."
+                      },
+                      "customer_email": { "type": "string", "nullable": true },
+                      "customer_details": {
+                        "type": "object",
+                        "nullable": true,
+                        "properties": { "email": { "type": "string", "nullable": true } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "StripeEventCharge": {
+        "allOf": [
+          { "$ref": "#/components/schemas/StripeEventEnvelope" },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "object",
+                "properties": {
+                  "object": {
+                    "type": "object",
+                    "description": "Stripe Charge (partial).",
+                    "properties": {
+                      "id": { "type": "string" },
+                      "metadata": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Must carry repository_id."
+                      },
+                      "receipt_email": { "type": "string", "nullable": true },
+                      "billing_details": {
+                        "type": "object",
+                        "properties": { "email": { "type": "string", "nullable": true } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "StripeEventDispute": {
+        "allOf": [
+          { "$ref": "#/components/schemas/StripeEventEnvelope" },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "object",
+                "properties": {
+                  "object": {
+                    "type": "object",
+                    "description": "Stripe Dispute (partial).",
+                    "properties": {
+                      "id": { "type": "string" },
+                      "reason": { "type": "string" },
+                      "amount": { "type": "integer", "format": "int64" },
+                      "metadata": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Must carry repository_id."
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "StripeEventSubscription": {
+        "allOf": [
+          { "$ref": "#/components/schemas/StripeEventEnvelope" },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "object",
+                "properties": {
+                  "object": {
+                    "type": "object",
+                    "description": "Stripe Subscription (partial).",
+                    "properties": {
+                      "id": { "type": "string" },
+                      "status": { "type": "string", "description": "e.g. active, trialing, canceled. activation acts only on active." },
+                      "trial_end": { "type": "integer", "format": "int64", "nullable": true, "description": "Used by the trial_will_end handler." },
+                      "metadata": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Carries org_id (key) and optional email (recipient)."
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "StripeEventInvoice": {
+        "allOf": [
+          { "$ref": "#/components/schemas/StripeEventEnvelope" },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "object",
+                "properties": {
+                  "object": {
+                    "type": "object",
+                    "description": "Stripe Invoice (partial).",
+                    "properties": {
+                      "id": { "type": "string", "nullable": true, "description": "Idempotency key for the paid-period record." },
+                      "customer_email": { "type": "string", "nullable": true },
+                      "metadata": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Must carry org_id."
+                      },
+                      "subscription": {
+                        "type": "object",
+                        "nullable": true,
+                        "properties": { "id": { "type": "string" } }
+                      },
+                      "period_start": { "type": "integer", "format": "int64" },
+                      "period_end": { "type": "integer", "format": "int64" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

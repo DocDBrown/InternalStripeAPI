@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+
+# Workflow-level permissions. id-token: write is required for
+# Google Cloud Workload Identity Federation (keyless auth).
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  IMAGE_NAME: internalstripeapi
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Secret scanning using the MIT-licensed gitleaks CLI directly.
+  # No GitHub Action wrapper = no org license requirement, no GITLEAKS_LICENSE.
+  # Runs in parallel with ci so a leaked secret blocks the pipeline before
+  # anything gets built or pushed. (Especially important here: this service
+  # holds Stripe secret keys and webhook signing secrets.)
+  # ---------------------------------------------------------------------------
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks needs full git history to scan all commits, not just HEAD.
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          # Pin a version rather than 'latest' so CI is reproducible.
+          GITLEAKS_VERSION="8.21.2"
+          echo "Installing gitleaks v${GITLEAKS_VERSION}"
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            -o gitleaks.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          gitleaks version
+
+      - name: Run gitleaks scan
+        run: |
+          # 'detect' scans the full git history.
+          # --redact hides secret values in logs so they don't leak into CI output.
+          # Non-zero exit if any leak is found, which fails the job.
+          echo "Running gitleaks secret scan over full history"
+          gitleaks detect \
+            --source . \
+            --redact \
+            --verbose
+
+  # ---------------------------------------------------------------------------
+  # Lint, format check, and tests inside the Rust container.
+  # Pure Rust backend (axum + sqlx + async-stripe + Pub/Sub) — no WASM target.
+  # ---------------------------------------------------------------------------
+  ci:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:trixie
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          # pkg-config + libssl-dev are needed because the Stripe client uses
+          # the crate's default TLS (native-tls), which links against OpenSSL.
+          apt-get update
+          apt-get install -y \
+            pkg-config \
+            libssl-dev \
+            curl
+
+      - name: Install Rust components
+        run: |
+          # Only rustfmt + clippy; no wasm32 target on a server-side service.
+          rustup component add rustfmt clippy
+
+      # Speeds up cold builds dramatically. Caching the cargo registry + target
+      # dir is a big win, especially with the async-stripe / sqlx dependency tree.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      # cargo fmt WITHOUT --check reformats files in place and always exits 0,
+      # so it never actually gates CI. The `-- --check` flag makes it fail when
+      # code is unformatted.
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test
