@@ -407,7 +407,9 @@ async fn stamps_updated_at_on_expired_transition() {
     let resp = post_webhook(&h.base_url, Some(&sig), &payload).await;
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
-        entitlement_status(&h.db, "repo-updated-at").await.as_deref(),
+        entitlement_status(&h.db, "repo-updated-at")
+            .await
+            .as_deref(),
         Some("expired")
     );
     // The audit timestamp must be present on the expired row.
