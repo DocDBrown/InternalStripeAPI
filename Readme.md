@@ -1,5 +1,7 @@
 # internal-stripe-api
 
+[![Build and Deploy](https://github.com/DocDBrown/InternalStripeAPI/actions/workflows/ci.yml/badge.svg)](https://github.com/DocDBrown/InternalStripeAPI/actions/workflows/ci.yml)
+
 ## Required external integrations
 
 - external stripe
