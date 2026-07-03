@@ -20,6 +20,7 @@
 
 # Postgres Tables
 
+```sql
 CREATE TABLE IF NOT EXISTS repository_entitlements (
     repository_id TEXT PRIMARY KEY,
     status        TEXT NOT NULL,
